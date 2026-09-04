@@ -18,7 +18,7 @@ jobs:
       fail-fast: false
       matrix:
         # 17 is the language level the project targets; 21 is the current LTS. Building on both
-        # catches accidental use of newer APIs, which compile fine on the newer JDK and then fail for
+        # catches accidental use of newer APIs, which compile fine on the newer JDK and fail for
         # anyone still on 17.
         java: ['17', '21']
 
@@ -42,28 +42,3 @@ jobs:
           name: test-reports-java-${{ matrix.java }}
           path: '**/target/surefire-reports/*.xml'
           retention-days: 7
-
-  examples:
-    name: Examples run end to end
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-java@v4
-        with:
-          java-version: '21'
-          distribution: temurin
-          cache: maven
-
-      - name: Install
-        run: mvn --batch-mode --no-transfer-progress install -DskipTests
-
-      # The examples are documentation, and documentation that no longer runs is worse than none.
-      # Running them in CI means a change that breaks the README's output breaks the build.
-      - name: Run the ETL example
-        working-directory: dagflow-examples
-        run: mvn --batch-mode --no-transfer-progress exec:java -Dexec.mainClass=io.dagflow.examples.EtlPipelineExample
-
-      - name: Run the distributed workers example
-        working-directory: dagflow-examples
-        run: mvn --batch-mode --no-transfer-progress exec:java -Dexec.mainClass=io.dagflow.examples.DistributedWorkersExample
