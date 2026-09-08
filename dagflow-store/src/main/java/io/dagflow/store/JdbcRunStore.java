@@ -592,8 +592,21 @@ public final class JdbcRunStore implements RunStore {
             runState = RunState.RUNNING;
         }
 
+        // Never move a run back out of a terminal state.
+        //
+        // The count above and this write are separate steps, so two workers finishing their last
+        // tasks concurrently can interleave: one counts 99 of 100 succeeded and computes RUNNING,
+        // the other counts 100 and computes SUCCEEDED, and whichever writes second wins. When that is
+        // the RUNNING one, the run stays non-terminal forever even though every task succeeded --
+        // a lost update, and a particularly nasty one because nothing looks broken until someone
+        // waits on a run that will never finish.
+        //
+        // Guarding on the current state fixes it without a lock. It is safe because these states are
+        // reached once and never left: SUCCEEDED requires every task to have succeeded, so no task
+        // can subsequently fail, and a FAILED task stays failed so every later recomputation agrees.
         try (PreparedStatement ps = connection.prepareStatement(
-                "UPDATE dagflow_run SET state = ?, updated_at = ? WHERE run_id = ?")) {
+                "UPDATE dagflow_run SET state = ?, updated_at = ? WHERE run_id = ? "
+                        + "AND state NOT IN ('SUCCEEDED', 'FAILED', 'CANCELLED')")) {
             ps.setString(1, runState.name());
             ps.setTimestamp(2, Timestamp.from(clock.now()));
             ps.setString(3, runId);
