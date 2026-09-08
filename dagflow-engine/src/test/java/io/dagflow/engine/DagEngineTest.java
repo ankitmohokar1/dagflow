@@ -313,29 +313,56 @@ class DagEngineTest {
     @Timeout(30)
     @DisplayName("FAIL_FAST stops starting anything new")
     void failFastStopsTheRun() {
-        CountDownLatch failed = new CountDownLatch(1);
-
+        // A single worker, which makes the ordering deterministic rather than merely likely: roots are
+        // submitted in sorted order, so "a-fails" is queued first, and with one thread it runs to
+        // completion -- failure propagation included -- before anything else is picked up.
+        //
+        // The first version of this test used a latch instead, with the failing task releasing an
+        // independent branch before throwing. That was flaky by construction: releasing the branch
+        // let it succeed and submit its dependent while the failure was still propagating, so whether
+        // the dependent started came down to which thread won. It passed on Java 17 and failed on 21,
+        // which is exactly the kind of test that erodes trust in a suite.
+        //
+        // The engine is not at fault there. Cancellation is cooperative and FAIL_FAST stops *starting*
+        // new work; a task unblocked in the same instant as a failure is a genuine tie, and closing
+        // that window would need a lock on every completion.
         Dag dag = Dag.named("fail-fast")
-                .task("fails", context -> {
-                    failed.countDown();
+                .task("a-fails", context -> {
                     throw new IOException("boom");
                 })
-                .task("gate", context -> {
-                    // Hold the second branch open until the failure has definitely happened, so the
-                    // test is about the policy rather than about which thread got there first.
-                    if (!failed.await(10, TimeUnit.SECONDS)) {
-                        throw new AssertionError("the failing task never ran");
-                    }
-                })
-                .task("after-gate", recording("after-gate")).dependsOn("gate")
+                .task("b-independent", recording("b-independent"))
+                .task("c-after-b", recording("c-after-b")).dependsOn("b-independent")
                 .build();
 
-        DagRun run = engine(4, FailurePolicy.FAIL_FAST).run(dag);
+        DagRun run = engine(1, FailurePolicy.FAIL_FAST).run(dag);
 
         assertThat(run.state()).isEqualTo(RunState.FAILED);
         assertThat(executionOrder)
-                .as("nothing new should start once the run is failing fast")
-                .doesNotContain("after-gate");
+                .as("once the run is failing fast, the independent branch must not be started either")
+                .isEmpty();
+        assertThat(run.stateOf(TaskId.of("b-independent"))).isEqualTo(TaskState.CANCELLED);
+        assertThat(run.stateOf(TaskId.of("c-after-b"))).isEqualTo(TaskState.CANCELLED);
+    }
+
+    @Test
+    @Timeout(30)
+    @DisplayName("the same graph under CONTINUE_INDEPENDENT does run the independent branch")
+    void continueIndependentRunsTheOtherBranch() {
+        // The counterpart to the test above, on an identical graph and the same single worker, so the
+        // only variable is the policy. Without this, "nothing ran" would also pass if the engine were
+        // simply broken.
+        Dag dag = Dag.named("continue")
+                .task("a-fails", context -> {
+                    throw new IOException("boom");
+                })
+                .task("b-independent", recording("b-independent"))
+                .task("c-after-b", recording("c-after-b")).dependsOn("b-independent")
+                .build();
+
+        DagRun run = engine(1, FailurePolicy.CONTINUE_INDEPENDENT).run(dag);
+
+        assertThat(run.state()).isEqualTo(RunState.FAILED);
+        assertThat(executionOrder).containsExactly("b-independent", "c-after-b");
     }
 
     // ---------------------------------------------------------------------------------------------
