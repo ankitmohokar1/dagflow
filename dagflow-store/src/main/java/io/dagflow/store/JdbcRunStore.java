@@ -59,8 +59,16 @@ public final class JdbcRunStore implements RunStore {
 
     private static final Logger log = LoggerFactory.getLogger(JdbcRunStore.class);
 
-    /** How many candidates a single claim attempt will fight over before giving up for this poll. */
-    private static final int CLAIM_CANDIDATES = 10;
+    /** How many candidate rows one query samples to fight over. */
+    private static final int CLAIM_CANDIDATES = 32;
+
+    /**
+     * How many times to re-sample when every candidate was lost to another worker.
+     *
+     * <p>Bounded so a pathologically contended caller cannot spin here indefinitely. Each round issues
+     * a fresh query, so the chance of losing every candidate in every round falls away very quickly.
+     */
+    private static final int MAX_CLAIM_ROUNDS = 8;
 
     private final DataSource dataSource;
     private final Clock clock;
@@ -220,17 +228,40 @@ public final class JdbcRunStore implements RunStore {
 
         reclaimExpiredLeases();
 
-        Instant now = clock.now();
-        List<Candidate> candidates = findClaimable(now);
+        // Re-sample when every candidate is lost, rather than reporting an empty queue.
+        //
+        // This is the difference between "there is no work" and "there was work, and I lost the race
+        // for every row I happened to look at". An earlier version conflated the two: it sampled a
+        // fixed number of rows once and returned empty if it lost them all. With more workers than
+        // sampled rows some worker is guaranteed to lose every race, and since a worker loop
+        // reasonably reads empty as "the queue has drained", those workers exited for good and left
+        // real work unclaimed. It passed locally and failed on CI, where fewer cores widen the window.
+        //
+        // InMemoryRunStore never had the problem because it holds a lock and scans every key, so the
+        // two implementations disagreed about what empty means. The shared contract suite is what
+        // surfaced that.
+        for (int round = 0; round < MAX_CLAIM_ROUNDS; round++) {
+            Instant now = clock.now();
+            List<Candidate> candidates = findClaimable(now);
 
-        for (Candidate candidate : candidates) {
-            Optional<Lease> claimed = tryClaim(candidate, workerId, leaseDuration, now);
-            if (claimed.isPresent()) {
-                return claimed;
+            if (candidates.isEmpty()) {
+                // Authoritative: a fresh query found nothing claimable.
+                return Optional.empty();
             }
-            // Lost the race for this row. Another worker has it; move on rather than retrying it.
-            log.trace("lost the claim race for {}/{}", candidate.runId, candidate.taskId);
+
+            for (Candidate candidate : candidates) {
+                Optional<Lease> claimed = tryClaim(candidate, workerId, leaseDuration, now);
+                if (claimed.isPresent()) {
+                    return claimed;
+                }
+                // Lost this row to another worker; try the next rather than retrying the same one.
+                log.trace("lost the claim race for {}/{}", candidate.runId, candidate.taskId);
+            }
         }
+
+        // Every row in every round went to someone else. Work probably remains, but this caller has
+        // spun enough; returning empty lets it back off rather than monopolising a connection.
+        log.debug("worker {} lost every claim race across {} rounds", workerId, MAX_CLAIM_ROUNDS);
         return Optional.empty();
     }
 

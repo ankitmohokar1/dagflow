@@ -276,7 +276,7 @@ class RunStoreContractTest {
         }
         String runId = newRun(store, builder.build());
 
-        int workers = 12;
+        int workers = 16;
         List<TaskId> claimed = Collections.synchronizedList(new ArrayList<>());
         CountDownLatch start = new CountDownLatch(1);
         ExecutorService pool = Executors.newFixedThreadPool(workers);
@@ -313,6 +313,46 @@ class RunStoreContractTest {
                 .as("a task claimed twice means two workers ran the same work concurrently")
                 .doesNotHaveDuplicates()
                 .hasSize(width);
+        assertThat(store.runState(runId)).contains(RunState.SUCCEEDED);
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("stores")
+    @DisplayName("claimNext reports empty only when nothing is actually claimable")
+    void emptyMeansEmpty(String name, RunStore store, TestClock clock) {
+        // The contract this pins down: an empty result must mean "there is no claimable work", not
+        // "I looked at some rows and did not get one". A worker loop cannot tell those apart, so it
+        // reasonably exits on empty -- and if empty can be returned while work remains, workers drain
+        // away and the run never finishes.
+        //
+        // JdbcRunStore violated this. It sampled a fixed number of candidate rows once per call and
+        // returned empty if it lost the race for all of them, which is guaranteed to happen to some
+        // worker whenever there are more workers than sampled rows. InMemoryRunStore never did,
+        // because it holds a lock and scans every key -- so the two implementations disagreed about
+        // what empty means, and only running one suite against both surfaced it.
+        int width = 60;
+        var builder = Dag.named("drain");
+        for (int i = 0; i < width; i++) {
+            builder.task("t-" + i, NOTHING);
+        }
+        String runId = newRun(store, builder.build());
+
+        int drained = 0;
+        while (true) {
+            Optional<Lease> lease = store.claimNext("solo-worker", Duration.ofMinutes(10));
+            if (lease.isEmpty()) {
+                break;
+            }
+            store.completeTask(lease.get());
+            drained++;
+            if (drained > width) {
+                break; // Guard against a store that never reports empty at all.
+            }
+        }
+
+        assertThat(drained)
+                .as("every claimable task must be handed out before empty is reported")
+                .isEqualTo(width);
         assertThat(store.runState(runId)).contains(RunState.SUCCEEDED);
     }
 
